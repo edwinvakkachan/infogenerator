@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  infogenerator:
+    build: .
+    container_name: infogenerator
+    restart: no
+    environment:
+      MONGODB_URI: ${MONGODB_URI}
+      MONGODB_DATABASE: ${MONGODB_DATABASE}
+      MEDIA_ROOT: ${MEDIA_ROOT}
+      OVERWRITE_NFO: ${OVERWRITE_NFO}
+      DRY_RUN: ${DRY_RUN}
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+
+
+
+
+
+
+
