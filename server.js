@@ -1,602 +1,452 @@
 
 import "dotenv/config";
 import { MongoClient } from "mongodb";
-import fs from "node:fs/promises";
-import path from "node:path";
 
 // ============================================================
 // CONFIGURATION
 // ============================================================
 
 const {
+    TUBEARCHIVIST_URL,
+    TUBEARCHIVIST_API_TOKEN,
     MONGODB_URI,
     MONGODB_DATABASE = "tubearchivist",
     MONGODB_COLLECTION = "jellyfin_sync",
-    MEDIA_ROOT = "/youtube",
-    OVERWRITE_NFO = "false",
-    DRY_RUN = "true",
-    VIDEO_EXTENSIONS = ".mp4,.mkv,.webm,.m4v,.mov"
+    CHECK_INTERVAL_MS = "300000",
 } = process.env;
 
-if (!MONGODB_URI) {
-    throw new Error("MONGODB_URI is missing from .env");
+const CHECK_INTERVAL = Number(CHECK_INTERVAL_MS);
+
+if (!TUBEARCHIVIST_URL) {
+    throw new Error("Missing TUBEARCHIVIST_URL in .env");
 }
 
-const overwriteNfo = OVERWRITE_NFO.toLowerCase() === "true";
-const dryRun = DRY_RUN.toLowerCase() === "true";
+if (!TUBEARCHIVIST_API_TOKEN) {
+    throw new Error("Missing TUBEARCHIVIST_API_TOKEN in .env");
+}
 
-const allowedExtensions = new Set(
-    VIDEO_EXTENSIONS.split(",")
-        .map(ext => ext.trim().toLowerCase())
-        .filter(Boolean)
-);
+if (!MONGODB_URI) {
+    throw new Error("Missing MONGODB_URI in .env");
+}
+
+if (!Number.isFinite(CHECK_INTERVAL) || CHECK_INTERVAL < 1000) {
+    throw new Error("CHECK_INTERVAL_MS must be at least 1000");
+}
+
+// ============================================================
+// MONGODB
+// ============================================================
 
 const mongoClient = new MongoClient(MONGODB_URI);
 
-// ============================================================
-// EXTRACT YOUTUBE ID FROM VIDEO FILENAME
-// Examples:
-// 6Kia7r71Tmg.mp4
-// Video title [6Kia7r71Tmg].mp4
-// ============================================================
+let collection;
+let stopping = false;
 
-function extractYoutubeIdFromName(filename) {
-    const stem = path.parse(filename).name;
-
-    if (/^[A-Za-z0-9_-]{11}$/.test(stem)) {
-        return stem;
-    }
-
-    const matches = [
-        ...stem.matchAll(/\[([A-Za-z0-9_-]{11})\]/g)
-    ];
-
-    return matches.length === 1 ? matches[0][1] : null;
-}
+// Fields no longer required by the NFO generator.
+const OBSOLETE_FIELDS = {
+    title: "",
+    channelId: "",
+    channelName: "",
+    published: "",
+    updatedAt: "",
+    createdAt: "",
+    jellyfinId: "",
+    jellyfinSynced: "",
+};
 
 // ============================================================
-// DATE HELPERS
+// TUBEARCHIVIST API
 // ============================================================
 
-function toValidDate(value) {
-    if (
-        value === null ||
-        value === undefined ||
-        value === ""
-    ) {
-        return null;
-    }
+async function tubeArchivistRequest(endpoint) {
+    const baseUrl = TUBEARCHIVIST_URL.replace(/\/$/, "");
+    const apiPath = endpoint.replace(/^\//, "");
 
-    let date;
-
-    if (value instanceof Date) {
-        date = value;
-    } else if (typeof value === "number") {
-        // Accept Unix seconds or milliseconds.
-        date = new Date(
-            Math.abs(value) < 1e12
-                ? value * 1000
-                : value
-        );
-    } else {
-        date = new Date(value);
-    }
-
-    return Number.isNaN(date.getTime()) ? null : date;
-}
-
-function getDownloadedAt(record) {
-    return (
-        toValidDate(record.downloadedAt) ||
-        toValidDate(record.dateDownloaded)
+    const response = await fetch(
+        `${baseUrl}/api/${apiPath}`,
+        {
+            method: "GET",
+            headers: {
+                Authorization: `Token ${TUBEARCHIVIST_API_TOKEN}`,
+                Accept: "application/json",
+            },
+            signal: AbortSignal.timeout(60000),
+        }
     );
-}
 
-// Jellyfin NFO dateadded format in UTC.
-function formatNfoDate(date) {
-    return date
-        .toISOString()
-        .replace("T", " ")
-        .slice(0, 19);
-}
+    if (!response.ok) {
+        const body = await response.text();
 
-// ============================================================
-// XML HELPERS
-// ============================================================
-
-function escapeXml(value) {
-    return String(value ?? "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&apos;");
-}
-
-function createNfo(record, youtubeId, date) {
-    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<episodedetails>
-  <title>${escapeXml(record.title || youtubeId)}</title>
-  <dateadded>${formatNfoDate(date)}</dateadded>
-  <uniqueid type="youtube" default="true">${youtubeId}</uniqueid>
-</episodedetails>
-`;
-}
-
-// Update only dateadded, preserving the other existing XML content.
-function updateExistingNfo(xml, date) {
-    const dateTag =
-        `<dateadded>${formatNfoDate(date)}</dateadded>`;
-
-    const existingDateTag =
-        /<dateadded\b[^>]*>[\s\S]*?<\/dateadded>/i;
-
-    if (existingDateTag.test(xml)) {
-        return {
-            ok: true,
-            content: xml.replace(existingDateTag, dateTag)
-        };
-    }
-
-    // Insert dateadded inside the existing root element.
-    const rootTag =
-        /<([A-Za-z_][\w:.-]*)(?:\s[^>]*)?>/;
-
-    const match = rootTag.exec(xml);
-
-    if (!match) {
-        return {
-            ok: false,
-            reason: "No recognizable XML root element"
-        };
-    }
-
-    const insertAt = match.index + match[0].length;
-
-    return {
-        ok: true,
-        content:
-            xml.slice(0, insertAt) +
-            "\n  " +
-            dateTag +
-            xml.slice(insertAt)
-    };
-}
-
-// ============================================================
-// READ YOUTUBE ID FROM .info.json IF NEEDED
-// ============================================================
-
-async function readYoutubeIdFromInfoJson(infoPath) {
-    try {
-        const info = JSON.parse(
-            await fs.readFile(infoPath, "utf8")
+        throw new Error(
+            `TubeArchivist API ${response.status}: ${body}`
         );
-
-        const id =
-            info.id ||
-            info.youtube_id ||
-            info.youtubeId;
-
-        return (
-            typeof id === "string" &&
-            /^[A-Za-z0-9_-]{11}$/.test(id)
-        )
-            ? id
-            : null;
-    } catch {
-        return null;
     }
+
+    return response.json();
 }
 
 // ============================================================
-// SCAN TUBEARCHIVIST MEDIA FOLDER
-//
-// /youtube/
-//   CHANNEL_ID/
-//     6Kia7r71Tmg.mp4
-//     6Kia7r71Tmg.info.json
-//     6Kia7r71Tmg.nfo
+// GET ALL VIDEOS
+// Supports common TubeArchivist pagination formats.
 // ============================================================
 
-async function scanVideoFiles(root) {
+async function getTubeArchivistVideos() {
     const videosById = new Map();
+    const visitedPages = new Set();
 
-    let scannedFiles = 0;
-    let infoJsonFiles = 0;
+    let page = 0;
+    let expectedTotal = null;
 
-    async function walk(directory) {
-        const entries = await fs.readdir(
-            directory,
-            { withFileTypes: true }
+    while (true) {
+        if (visitedPages.has(page)) {
+            break;
+        }
+
+        visitedPages.add(page);
+
+        console.log(`Fetching TubeArchivist page ${page}...`);
+
+        const data = await tubeArchivistRequest(
+            `video/?page=${page}`
         );
 
-        for (const entry of entries) {
-            const fullPath = path.join(
-                directory,
-                entry.name
+        let batch = [];
+        let pagination = null;
+
+        if (Array.isArray(data)) {
+            batch = data;
+        } else if (Array.isArray(data?.data)) {
+            batch = data.data;
+            pagination = data.paginate ?? null;
+        } else if (Array.isArray(data?.results)) {
+            batch = data.results;
+            pagination = data.pagination ?? data.paginate ?? null;
+        } else if (Array.isArray(data?.items)) {
+            batch = data.items;
+            pagination = data.pagination ?? data.paginate ?? null;
+        } else {
+            throw new Error(
+                "Unexpected TubeArchivist video-list response format"
             );
+        }
 
-            if (entry.isDirectory()) {
-                await walk(fullPath);
-                continue;
+        if (pagination) {
+            const total = Number(pagination.total_hits);
+
+            if (Number.isFinite(total) && total >= 0) {
+                expectedTotal = total;
             }
+        }
 
-            if (!entry.isFile()) {
-                continue;
-            }
+        if (batch.length === 0) {
+            break;
+        }
 
-            const extension =
-                path.extname(entry.name).toLowerCase();
+        let newCount = 0;
 
-            if (!allowedExtensions.has(extension)) {
-                continue;
-            }
-
-            scannedFiles++;
-
-            let youtubeId =
-                extractYoutubeIdFromName(entry.name);
-
-            // Fallback to the corresponding info.json file.
-            if (!youtubeId) {
-                const infoPath = path.join(
-                    directory,
-                    `${path.parse(entry.name).name}.info.json`
-                );
-
-                youtubeId =
-                    await readYoutubeIdFromInfoJson(infoPath);
-            }
+        for (const video of batch) {
+            const youtubeId = video.youtube_id || video.id;
 
             if (!youtubeId) {
                 continue;
             }
 
             if (!videosById.has(youtubeId)) {
-                videosById.set(youtubeId, []);
+                newCount++;
             }
 
-            videosById.get(youtubeId).push(fullPath);
+            videosById.set(youtubeId, video);
         }
-    }
 
-    async function countInfoFiles(directory) {
-        const entries = await fs.readdir(
-            directory,
-            { withFileTypes: true }
+        console.log(
+            `Page ${page}: ${batch.length} returned, ` +
+            `${newCount} new, ${videosById.size} unique`
         );
 
-        for (const entry of entries) {
-            const fullPath = path.join(
-                directory,
-                entry.name
+        const nextPages = Array.isArray(pagination?.next_pages)
+            ? pagination.next_pages
+                .map(Number)
+                .filter(Number.isFinite)
+            : [];
+
+        if (nextPages.length > 0) {
+            const nextPage = nextPages.find(
+                candidate => !visitedPages.has(candidate)
             );
 
-            if (entry.isDirectory()) {
-                await countInfoFiles(fullPath);
-            } else if (
-                entry.isFile() &&
-                entry.name.endsWith(".info.json")
-            ) {
-                infoJsonFiles++;
+            if (nextPage === undefined) {
+                break;
             }
-        }
-    }
 
-    await walk(root);
-    await countInfoFiles(root);
-
-    console.log(`📁 Video files scanned: ${scannedFiles}`);
-    console.log(`🧾 .info.json files found: ${infoJsonFiles}`);
-    console.log(
-        `🔗 Video files matched to YouTube IDs: ${videosById.size}`
-    );
-
-    return videosById;
-}
-
-// ============================================================
-// CREATE OR UPDATE NFO
-// ============================================================
-
-async function writeNfo(
-    videoPath,
-    record,
-    youtubeId,
-    date
-) {
-    const nfoPath = path.join(
-        path.dirname(videoPath),
-        `${path.basename(
-            videoPath,
-            path.extname(videoPath)
-        )}.nfo`
-    );
-
-    let existingContent = null;
-
-    try {
-        existingContent = await fs.readFile(
-            nfoPath,
-            "utf8"
-        );
-    } catch (error) {
-        if (error.code !== "ENOENT") {
-            throw error;
-        }
-    }
-
-    // Preserve existing NFO unless overwrite is explicitly enabled.
-    if (existingContent !== null) {
-        if (!overwriteNfo) {
-            return "skipped-existing";
+            page = nextPage;
+            continue;
         }
 
-        const result = updateExistingNfo(
-            existingContent,
-            date
-        );
+        const lastPage = Number(pagination?.last_page);
 
-        if (!result.ok) {
+        if (Number.isFinite(lastPage) && lastPage >= 0) {
+            if (page >= lastPage) {
+                break;
+            }
+
+            page++;
+            continue;
+        }
+
+        // Without pagination metadata, stop if no new IDs appear.
+        if (newCount === 0) {
             console.warn(
-                `⚠️ Could not safely edit NFO: ${nfoPath}`
+                "No new video IDs found; stopping pagination."
             );
-            console.warn(`   ${result.reason}`);
-
-            return "invalid-existing";
+            break;
         }
 
-        if (result.content === existingContent) {
-            return "already-correct";
+        if (
+            expectedTotal !== null &&
+            videosById.size >= expectedTotal
+        ) {
+            break;
         }
 
-        if (dryRun) {
-            console.log(
-                `🧪 Would update dateadded: ${nfoPath}`
-            );
-
-            return "would-update";
-        }
-
-        await fs.writeFile(
-            nfoPath,
-            result.content,
-            "utf8"
-        );
-
-        console.log(`📝 Updated dateadded: ${nfoPath}`);
-
-        return "updated";
+        page++;
     }
 
-    const content = createNfo(
-        record,
-        youtubeId,
-        date
+    console.log(
+        `Total unique TubeArchivist videos: ${videosById.size}`
     );
 
-    if (dryRun) {
-        console.log(`🧪 Would create: ${nfoPath}`);
-        return "would-create";
-    }
-
-    // "wx" prevents accidentally overwriting an existing file.
-    try {
-        await fs.writeFile(
-            nfoPath,
-            content,
-            {
-                encoding: "utf8",
-                flag: "wx"
-            }
+    if (
+        expectedTotal !== null &&
+        videosById.size < expectedTotal
+    ) {
+        console.warn(
+            `API reports ${expectedTotal} videos, but collected ` +
+            `${videosById.size}.`
         );
-    } catch (error) {
-        if (error.code === "EEXIST") {
-            return "skipped-existing";
-        }
-
-        throw error;
     }
 
-    console.log(`✅ Created: ${nfoPath}`);
-
-    return "created";
+    return [...videosById.values()];
 }
 
 // ============================================================
-// MAIN
+// GET FULL VIDEO DETAILS
 // ============================================================
 
-async function main() {
-    const mediaRoot = path.resolve(MEDIA_ROOT);
+async function getTubeArchivistVideo(youtubeId) {
+    return tubeArchivistRequest(
+        `video/${encodeURIComponent(youtubeId)}/`
+    );
+}
 
-    const rootStats = await fs
-        .stat(mediaRoot)
-        .catch(() => null);
+// ============================================================
+// NORMALIZE THE DOWNLOAD TIMESTAMP
+// ============================================================
 
-    if (!rootStats?.isDirectory()) {
-        throw new Error(
-            `MEDIA_ROOT is not an accessible directory: ${mediaRoot}`
-        );
+function normalizeVideo(video) {
+    const youtubeId = video.youtube_id || video.id;
+    const rawTimestamp = video.date_downloaded;
+
+    if (!youtubeId || rawTimestamp == null || rawTimestamp === "") {
+        return null;
     }
 
+    const dateDownloaded = Number(rawTimestamp);
+
+    if (
+        !Number.isFinite(dateDownloaded) ||
+        dateDownloaded <= 0
+    ) {
+        return null;
+    }
+
+    const downloadedAt = new Date(dateDownloaded * 1000);
+
+    if (Number.isNaN(downloadedAt.getTime())) {
+        return null;
+    }
+
+    // Only the fields required by the NFO generator are retained.
+    return {
+        youtubeId,
+        dateDownloaded,
+        downloadedAt,
+    };
+}
+
+// ============================================================
+// SAVE MINIMAL RECORD
+// ============================================================
+
+async function saveVideo(video) {
+    const normalized = normalizeVideo(video);
+
+    if (!normalized) {
+        return false;
+    }
+
+    await collection.updateOne(
+        { youtubeId: normalized.youtubeId },
+        {
+            $set: {
+                dateDownloaded: normalized.dateDownloaded,
+                downloadedAt: normalized.downloadedAt,
+            },
+            $setOnInsert: {
+                youtubeId: normalized.youtubeId,
+            },
+        },
+        { upsert: true }
+    );
+
+    return true;
+}
+
+// ============================================================
+// SYNC TUBEARCHIVIST TO MONGODB
+// ============================================================
+
+async function syncTubeArchivist() {
     console.log("");
     console.log("=================================================");
-    console.log("🎬 TUBEARCHIVIST NFO DATE ADDED GENERATOR");
+    console.log("TUBEARCHIVIST -> MONGODB SYNC");
+    console.log("Started:", new Date().toISOString());
     console.log("=================================================");
-    console.log(`📂 Media root: ${mediaRoot}`);
-    console.log(
-        `🗄️ MongoDB: ${MONGODB_DATABASE}.${MONGODB_COLLECTION}`
-    );
-    console.log(
-        `✏️ Overwrite existing NFO: ${overwriteNfo}`
-    );
-    console.log(`🧪 Dry run: ${dryRun}`);
+
+    let saved = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    try {
+        const videos = await getTubeArchivistVideos();
+
+        for (const video of videos) {
+            if (stopping) {
+                break;
+            }
+
+            const youtubeId = video.youtube_id || video.id;
+
+            if (!youtubeId) {
+                skipped++;
+                continue;
+            }
+
+            try {
+                // Get the full object because the list response may
+                // not include date_downloaded.
+                const fullVideo =
+                    await getTubeArchivistVideo(youtubeId);
+
+                const normalized = normalizeVideo(fullVideo);
+
+                if (!normalized) {
+                    console.warn(
+                        `${youtubeId}: missing/invalid date_downloaded`
+                    );
+                    skipped++;
+                    continue;
+                }
+
+                await saveVideo(fullVideo);
+                saved++;
+
+                console.log(
+                    `Saved ${normalized.youtubeId} -> ` +
+                    normalized.downloadedAt.toISOString()
+                );
+            } catch (error) {
+                failed++;
+
+                console.error(
+                    `Failed ${youtubeId}: ${error.message}`
+                );
+            }
+        }
+
+        console.log("");
+        console.log("Sync finished.");
+        console.log("Saved:", saved);
+        console.log("Skipped:", skipped);
+        console.log("Failed:", failed);
+        console.log("Next interval:", CHECK_INTERVAL_MS, "ms");
+        console.log("=================================================");
+    } catch (error) {
+        console.error(
+            "TubeArchivist sync failed:",
+            error.message
+        );
+    }
+}
+
+// ============================================================
+// PERIODIC LOOP
+// Wait for each sync to finish before starting another.
+// ============================================================
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function main() {
+    console.log("Connecting to MongoDB...");
 
     await mongoClient.connect();
 
-    const collection = mongoClient
+    collection = mongoClient
         .db(MONGODB_DATABASE)
         .collection(MONGODB_COLLECTION);
 
-    const records = await collection.find({
-        youtubeId: {
-            $exists: true,
-            $ne: null
-        },
-        $or: [
-            {
-                downloadedAt: {
-                    $exists: true,
-                    $ne: null
-                }
-            },
-            {
-                dateDownloaded: {
-                    $exists: true,
-                    $ne: null
-                }
-            }
-        ]
-    }).toArray();
-
-    console.log(
-        `📊 MongoDB records with date fields: ${records.length}`
+    await collection.createIndex(
+        { youtubeId: 1 },
+        { unique: true }
     );
 
-    const recordsById = new Map();
-    let invalidRecords = 0;
+    console.log("MongoDB connected.");
 
-    for (const record of records) {
-        const youtubeId =
-            String(record.youtubeId).trim();
+    // Remove obsolete fields from existing documents.
+    const cleanup = await collection.updateMany(
+        {},
+        { $unset: OBSOLETE_FIELDS }
+    );
 
-        const date = getDownloadedAt(record);
+    console.log(
+        `Removed obsolete fields from ${cleanup.modifiedCount} document(s).`
+    );
 
-        if (
-            !/^[A-Za-z0-9_-]{11}$/.test(youtubeId) ||
-            !date
-        ) {
-            invalidRecords++;
-            continue;
-        }
+    while (!stopping) {
+        await syncTubeArchivist();
 
-        recordsById.set(youtubeId, {
-            ...record,
-            _nfoDate: date
-        });
-    }
-
-    const videosById =
-        await scanVideoFiles(mediaRoot);
-
-    const stats = {
-        created: 0,
-        updated: 0,
-        skippedExisting: 0,
-        alreadyCorrect: 0,
-        missingFiles: 0,
-        missingRecords: 0,
-        invalidExisting: 0,
-        wouldCreate: 0,
-        wouldUpdate: 0,
-        failed: 0
-    };
-
-    const resultKeys = {
-        "created": "created",
-        "updated": "updated",
-        "skipped-existing": "skippedExisting",
-        "already-correct": "alreadyCorrect",
-        "invalid-existing": "invalidExisting",
-        "would-create": "wouldCreate",
-        "would-update": "wouldUpdate"
-    };
-
-    // Process existing and newly downloaded videos.
-    for (const [youtubeId, record] of recordsById) {
-        const videoPaths =
-            videosById.get(youtubeId);
-
-        if (!videoPaths?.length) {
+        if (!stopping) {
             console.log(
-                `⏳ No local video file found: ${youtubeId}`
+                `Waiting ${CHECK_INTERVAL_MS} ms until next sync...`
             );
 
-            stats.missingFiles++;
-            continue;
-        }
-
-        for (const videoPath of videoPaths) {
-            try {
-                const result = await writeNfo(
-                    videoPath,
-                    record,
-                    youtubeId,
-                    record._nfoDate
-                );
-
-                const key = resultKeys[result];
-
-                if (key) {
-                    stats[key]++;
-                }
-            } catch (error) {
-                stats.failed++;
-
-                console.error(`❌ Failed: ${videoPath}`);
-                console.error(`   ${error.message}`);
-            }
+            await sleep(CHECK_INTERVAL);
         }
     }
-
-    // Count local video IDs that have no valid MongoDB record.
-    for (const youtubeId of videosById.keys()) {
-        if (!recordsById.has(youtubeId)) {
-            stats.missingRecords++;
-        }
-    }
-
-    console.log("");
-    console.log("=================================================");
-    console.log("📋 SUMMARY");
-    console.log("=================================================");
-    console.log(
-        `📊 Valid MongoDB records: ${recordsById.size}`
-    );
-    console.log(
-        `⚠️ Invalid MongoDB records: ${invalidRecords}`
-    );
-    console.log(`✅ NFO files created: ${stats.created}`);
-    console.log(
-        `📝 Existing NFO dates updated: ${stats.updated}`
-    );
-    console.log(
-        `⏭️ Existing NFO files preserved: ${stats.skippedExisting}`
-    );
-    console.log(
-        `✔️ Dates already correct: ${stats.alreadyCorrect}`
-    );
-    console.log(`🧪 Would create: ${stats.wouldCreate}`);
-    console.log(`🧪 Would update: ${stats.wouldUpdate}`);
-    console.log(
-        `⏳ Records with no local video: ${stats.missingFiles}`
-    );
-    console.log(
-        `❓ Local video IDs missing from MongoDB: ${stats.missingRecords}`
-    );
-    console.log(
-        `⚠️ Existing NFO files not safely editable: ${stats.invalidExisting}`
-    );
-    console.log(`❌ Failures: ${stats.failed}`);
 }
 
-main()
-    .catch(error => {
-        console.error("❌ NFO generator failed:", error);
-        process.exitCode = 1;
-    })
-    .finally(async () => {
-        await mongoClient.close().catch(() => {});
-    });
+// ============================================================
+// CLEAN SHUTDOWN
+// ============================================================
+
+async function shutdown(signal) {
+    if (stopping) {
+        return;
+    }
+
+    stopping = true;
+    console.log(`Received ${signal}; shutting down...`);
+
+    await mongoClient.close().catch(() => {});
+    process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+main().catch(async error => {
+    console.error("Fatal error:", error);
+    await mongoClient.close().catch(() => {});
+    process.exit(1);
+});
