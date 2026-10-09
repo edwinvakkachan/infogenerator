@@ -1,23 +1,21 @@
-version: "3.8"
 
 services:
   infogenerator:
     build: .
     container_name: infogenerator
-    restart: no
+    restart: "no"
+
+    volumes:
+      - ${MEDIA_HOST_PATH}:/youtube:rw
+
     environment:
       MONGODB_URI: ${MONGODB_URI}
-      MONGODB_DATABASE: ${MONGODB_DATABASE}
-      MEDIA_ROOT: ${MEDIA_ROOT}
-      OVERWRITE_NFO: ${OVERWRITE_NFO}
-      DRY_RUN: ${DRY_RUN}
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-tubearchivist}
+      MONGODB_COLLECTION: ${MONGODB_COLLECTION:-jellyfin_sync}
+      MEDIA_ROOT: /youtube
+      OVERWRITE_NFO: ${OVERWRITE_NFO:-false}
+      DRY_RUN: ${DRY_RUN:-true}
+
     dns:
       - 1.1.1.1
       - 1.0.0.1
-
-
-
-
-
-
-
