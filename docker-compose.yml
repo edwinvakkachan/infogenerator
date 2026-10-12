@@ -3,7 +3,7 @@ services:
   infogenerator:
     build: .
     container_name: infogenerator
-    restart: "no"
+    restart: "always"
 
     volumes:
       - ${MEDIA_HOST_PATH}:/youtube:rw
